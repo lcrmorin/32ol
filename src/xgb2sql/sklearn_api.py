@@ -8,6 +8,8 @@ emit_sas.py for why SAS support is currently sklearn-only.
 from sklearn.ensemble import (
     GradientBoostingClassifier,
     GradientBoostingRegressor,
+    HistGradientBoostingClassifier,
+    HistGradientBoostingRegressor,
     RandomForestClassifier,
     RandomForestRegressor,
 )
@@ -19,12 +21,15 @@ from xgb2sql.parse_sklearn import (
     decision_tree_to_ensemble,
     gradient_boosting_classifier_to_ensemble,
     gradient_boosting_regressor_to_ensemble,
+    hist_gradient_boosting_classifier_to_ensemble,
+    hist_gradient_boosting_regressor_to_ensemble,
     random_forest_to_ensemble,
 )
 
 _SUPPORTED = (
     "DecisionTreeRegressor, DecisionTreeClassifier, RandomForestRegressor, "
-    "RandomForestClassifier, GradientBoostingRegressor, GradientBoostingClassifier"
+    "RandomForestClassifier, GradientBoostingRegressor, GradientBoostingClassifier, "
+    "HistGradientBoostingRegressor, HistGradientBoostingClassifier"
 )
 
 
@@ -47,6 +52,10 @@ def _model_to_ensemble(model, feature_names: list):
         return gradient_boosting_regressor_to_ensemble(model, feature_names)
     if isinstance(model, GradientBoostingClassifier):
         return gradient_boosting_classifier_to_ensemble(model, feature_names)
+    if isinstance(model, HistGradientBoostingRegressor):
+        return hist_gradient_boosting_regressor_to_ensemble(model, feature_names)
+    if isinstance(model, HistGradientBoostingClassifier):
+        return hist_gradient_boosting_classifier_to_ensemble(model, feature_names)
     raise NotImplementedError(f"{type(model).__name__} is not supported. Supported: {_SUPPORTED}.")
 
 

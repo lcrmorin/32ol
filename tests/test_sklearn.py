@@ -25,6 +25,8 @@ import pytest
 from sklearn.ensemble import (
     GradientBoostingClassifier,
     GradientBoostingRegressor,
+    HistGradientBoostingClassifier,
+    HistGradientBoostingRegressor,
     RandomForestClassifier,
     RandomForestRegressor,
 )
@@ -102,6 +104,64 @@ def test_gradient_boosting_regressor_sas(data):
     X, y, _, _ = data
     m = GradientBoostingRegressor(n_estimators=12, max_depth=3, random_state=0).fit(X, y)
     _check_sas(sklearn_to_sas(m, FEATURES), X, m.predict(X))
+
+
+def test_hist_gradient_boosting_regressor_sql(data, duck):
+    X, y, _, _ = data
+    m = HistGradientBoostingRegressor(max_iter=15, max_depth=5, random_state=0).fit(X, y)
+    _check_sql(duck, sklearn_to_sql(m, FEATURES), m.predict(X))
+
+
+def test_hist_gradient_boosting_regressor_sas(data):
+    X, y, _, _ = data
+    m = HistGradientBoostingRegressor(max_iter=15, max_depth=5, random_state=0).fit(X, y)
+    _check_sas(sklearn_to_sas(m, FEATURES), X, m.predict(X))
+
+
+def test_hist_gradient_boosting_regressor_missing_values(data, duck):
+    X, y, _, _ = data
+    Xm = X.copy()
+    Xm.loc[::5, "a"] = np.nan
+    m = HistGradientBoostingRegressor(max_iter=15, max_depth=5, random_state=0).fit(X, y)
+    con = duckdb.connect()
+    con.register("t", Xm)
+    _check_sql(con, sklearn_to_sql(m, FEATURES), m.predict(Xm))
+    _check_sas(sklearn_to_sas(m, FEATURES), Xm, m.predict(Xm))
+
+
+def test_hist_gradient_boosting_classifier_binary_sql(data, duck):
+    X, _, yb, _ = data
+    m = HistGradientBoostingClassifier(max_iter=15, max_depth=5, random_state=0).fit(X, yb)
+    _check_sql(duck, sklearn_to_sql(m, FEATURES), m.predict_proba(X)[:, 1])
+
+
+def test_hist_gradient_boosting_classifier_binary_sas(data):
+    X, _, yb, _ = data
+    m = HistGradientBoostingClassifier(max_iter=15, max_depth=5, random_state=0).fit(X, yb)
+    _check_sas(sklearn_to_sas(m, FEATURES), X, m.predict_proba(X)[:, 1])
+
+
+def test_hist_gradient_boosting_classifier_multiclass_raises():
+    rng = np.random.default_rng(0)
+    X = pd.DataFrame(rng.random((90, 3)), columns=FEATURES)
+    y3 = pd.cut(X["a"], 3, labels=False)
+    m = HistGradientBoostingClassifier(max_iter=5, max_depth=2).fit(X, y3)
+    with pytest.raises(NotImplementedError):
+        sklearn_to_sql(m, FEATURES)
+
+
+def test_hist_gradient_boosting_categorical_split_raises():
+    rng = np.random.default_rng(0)
+    X = pd.DataFrame(rng.random((300, 2)), columns=["a", "b"])
+    cat = rng.integers(0, 4, size=300).astype(float)
+    X["c"] = cat
+    y = (cat >= 2).astype(int)  # purely category-driven, so a categorical split is used
+    m = HistGradientBoostingClassifier(max_iter=5, max_depth=3, categorical_features=[2]).fit(X, y)
+    assert any(
+        pred.nodes["is_categorical"].any() for round_ in m._predictors for pred in round_
+    ), "fixture didn't actually produce a categorical split"
+    with pytest.raises(NotImplementedError):
+        sklearn_to_sql(m, ["a", "b", "c"])
 
 
 def test_gradient_boosting_regressor_unsupported_loss_raises():

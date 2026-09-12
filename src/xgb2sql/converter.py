@@ -17,8 +17,11 @@ from typing import Optional
 import pandas as pd
 import xgboost as xgb
 
+from xgb2sql.emit_sas import ensemble_to_sas
 from xgb2sql.emit_sql import ensemble_to_sql, multiclass_to_sql
+from xgb2sql.ir import Ensemble
 from xgb2sql.parse_xgb import xgb_to_ensemble, xgb_to_multiclass_ensembles
+from xgb2sql.quantize import check_xgb_sas_safety
 
 
 def xgboost_to_sql(
@@ -83,6 +86,63 @@ def xgboost_to_sql_multiclass(
         training_df=training_df,
     )
     return multiclass_to_sql(ensembles, float_type=float_type)
+
+
+def xgboost_to_sas(
+    model: xgb.Booster,
+    bins_per_feature: dict,
+    sigmoid: bool = False,
+    cat_feature_names: Optional[list] = None,
+    cat_label_maps: Optional[dict] = None,
+    training_df: Optional[pd.DataFrame] = None,
+    link: Optional[str] = None,
+) -> str:
+    """Convert an XGBoost model to SAS - ONLY if every feature was quantized
+    to a small number of integer levels via xgb2sql.quantize.IntegerBinner
+    (or an equivalent scheme) AND the resulting model's thresholds are
+    verified safe against those achievable values. Raises ValueError with
+    the specific violations if not - see quantize.py for why xgboost needs
+    this and DecisionTree/RandomForest/GradientBoosting/HistGradientBoosting
+    don't (sklearn_to_sas has no such restriction).
+
+    Args:
+        model: Trained xgb.Booster, fit on data that was quantized with the
+            SAME IntegerBinner you pass bins_per_feature from.
+        bins_per_feature: {feature_name: n_bins} - e.g. IntegerBinner().levels().
+            Every numeric-split feature in the model must have an entry.
+        (other args: see xgboost_to_sql)
+
+    Returns:
+        SAS expression string for `prediction = {expr};`.
+
+    Raises:
+        ValueError: if any threshold isn't safely separated from an
+            achievable quantized value - the model (or its bin count /
+            max_depth) needs to change, not this function's logic.
+    """
+    ensemble = xgb_to_ensemble(
+        model, sigmoid=sigmoid, cat_feature_names=cat_feature_names,
+        cat_label_maps=cat_label_maps, training_df=training_df, link=link,
+    )
+    violations = check_xgb_sas_safety(ensemble, bins_per_feature)
+    if violations:
+        shown = violations[:5]
+        more = f" (+{len(violations) - 5} more)" if len(violations) > 5 else ""
+        raise ValueError(
+            "xgboost_to_sas refused: this model's thresholds are not safely separated "
+            f"from the declared achievable quantized values. {len(violations)} violation(s), "
+            f"first {len(shown)}: " + "; ".join(shown) + more +
+            ". Try fewer bins (a coarser IntegerBinner), a shallower model (lower "
+            "max_depth), or fewer boosting rounds - see quantize.py for why this isn't "
+            "guaranteed by quantization alone."
+        )
+    # Safety verified for this specific declared grid: emit as float64-precision
+    # (no cast needed) rather than the blocked float32 path.
+    safe_ensemble = Ensemble(
+        trees=ensemble.trees, base_score=ensemble.base_score,
+        link=ensemble.link, threshold_precision="float64",
+    )
+    return ensemble_to_sas(safe_ensemble)
 
 
 def prepare_df_for_duckdb(df, cat_feature_names=None):

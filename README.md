@@ -6,19 +6,20 @@ Convert a trained tree model into SQL or SAS for scoring outside Python - no mod
 
 | Source model | -> SQL | -> SAS |
 |---|---|---|
-| XGBoost (`Booster`, `booster="gbtree"`) | Yes - verified against DuckDB (28 tests) | Not yet - see "Why xgboost has no SAS output yet" below |
+| XGBoost (`Booster`, `booster="gbtree"`) | Yes - verified against DuckDB | Only if trained on quantized integer features - see "XGBoost -> SAS: the quantizer" below |
 | `DecisionTreeRegressor` / `DecisionTreeClassifier` | Yes - verified against DuckDB | Yes - see "SAS caveat" below |
 | `RandomForestRegressor` / `RandomForestClassifier` | Yes - verified against DuckDB | Yes - see "SAS caveat" below |
 | `GradientBoostingRegressor` (`loss="squared_error"`) | Yes - verified against DuckDB | Yes - see "SAS caveat" below |
 | `GradientBoostingClassifier` (binary, `loss="log_loss"`) | Yes - verified against DuckDB | Yes - see "SAS caveat" below |
+| `HistGradientBoostingRegressor` / `Classifier` (binary, non-categorical) | Yes - verified against DuckDB | Yes - see "SAS caveat" below |
 
-Multiclass: supported for `DecisionTreeClassifier`/`RandomForestClassifier` (both languages) and XGBoost (SQL only). Multiclass `GradientBoostingClassifier` is not supported (raises `NotImplementedError`) - it needs a per-round softmax across classes that hasn't been built yet.
+Multiclass: supported for `DecisionTreeClassifier`/`RandomForestClassifier` (both languages) and XGBoost (SQL only). Multiclass `GradientBoostingClassifier`/`HistGradientBoostingClassifier` is not supported (raises `NotImplementedError`) - both need a per-round softmax across classes that hasn't been built yet.
 
-Not supported anywhere yet: LightGBM, CatBoost, `HistGradientBoosting*` (different tree representation from plain sklearn CART), `ExtraTrees*`.
+Not supported anywhere yet: LightGBM, CatBoost, `ExtraTrees*`, `HistGradientBoosting*` trained with `categorical_features` set (raises rather than silently ignoring the categorical split).
 
 ## Why a dedicated package instead of an existing one (SQL side)
 
-Closest prior art: `gbm2sql` (one-commit demo), `sqlgbm` (README says "not ready for production"), the R-only `xgb2sql` package of a similar name, and `m2cgen` (general model-export tool, 3,000 stars, but no release since April 2022 and doesn't target SQL). None is a real substitute. See `existing_package_mapping.md`.
+Closest prior art: `gbm2sql` (one-commit demo), `sqlgbm` (README says "not ready for production"), the R-only `xgb2sql` package of a similar name, and `m2cgen` (general model-export tool, 3,000 stars, but no release since April 2022, and SAS is not in its supported-language list - checked directly against its own README). The one SAS-adjacent tool found is a 7-star tutorial repo that hand-translates `m2cgen`'s Visual Basic output into SAS, not a real converter. See `existing_package_mapping.md`.
 
 ## Install
 
@@ -48,22 +49,32 @@ sas_expr = sklearn_to_sas(model, feature_names=list(X.columns))  # prediction = 
 
 ## SAS caveat - read before using in production
 
-There is no SAS installation available anywhere this package has been built or tested. SAS output for sklearn models has been checked with a hand-written interpreter of the exact narrow SAS expression subset this package emits (`tests/sas_interp.py`) - it catches real logic bugs, but it is **not** the same as running the generated code in a real SAS session. Treat it with the same caution as the MySQL/PostgreSQL item below: logic checked as carefully as possible without the real target, but not yet confirmed against it. If you run this against real SAS and it works (or doesn't), that's valuable feedback.
+There is no SAS installation available anywhere this package has been built or tested. SAS output has been checked with a hand-written interpreter of the exact narrow SAS expression subset this package emits (`tests/sas_interp.py`) - it catches real logic bugs, but it is **not** the same as running the generated code in a real SAS session. Treat it with the same caution as the MySQL/PostgreSQL item below: logic checked as carefully as possible without the real target, but not yet confirmed against it.
 
-## Why xgboost has no SAS output yet
+One real, hit-in-testing limitation of the SAS approach specifically: SAS's `IFN` function (used for every branch) evaluates ALL of its arguments rather than short-circuiting, per SAS's documented behavior - so a deep tree with many rounds evaluates every branch on every call, not just the taken one. This was slow enough in the Python test interpreter (which shares that eager-evaluation semantics deliberately, to match real SAS) that a 500-tree, depth-8 model's end-to-end test had to be trimmed to 20 rows to finish in reasonable time. Real SAS is presumably far faster than a Python interpreter at raw arithmetic, but this has not been benchmarked against a real instance - if you're scoring a large ensemble, this is worth checking before relying on it in production.
 
-The SQL emitter's float32-precision correctness trick is `CAST(column AS FLOAT)`, which relies on the SQL engine having a real 4-byte float type, so the incoming value gets truncated to float32 the same way XGBoost's own internal comparison does. A SAS DATA step has no verified equivalent (SAS numeric variables are IEEE double precision; there's no confirmed bit-exact float32-truncation function/idiom). Skipping the truncation isn't safe either - the SQLite case below shows what happens when you skip it: ~7% of rows misrouted. So xgboost-to-SAS is deliberately blocked (raises `NotImplementedError`) rather than shipping something unverified. sklearn's own trees compare in float64 natively, so this problem doesn't apply to sklearn-to-SAS at all.
+## Why plain XGBoost has no SAS output, and what unlocks it
+
+The SQL emitter's float32-precision correctness trick is `CAST(column AS FLOAT)`, which relies on the SQL engine having a real 4-byte float type, so the incoming value gets truncated to float32 the same way XGBoost's own internal comparison does. A SAS DATA step has no verified equivalent (SAS numeric variables are IEEE double precision; there's no confirmed bit-exact float32-truncation function/idiom). Skipping the truncation isn't safe by default either - the SQLite case below shows what happens when you skip it unconditionally: ~7% of rows misrouted. So `xgboost_to_sas` on an ordinary model raises `NotImplementedError`.
+
+sklearn's own trees (including `HistGradientBoosting`, confirmed by inspecting its raw node arrays - its stored thresholds are genuine float64, `num_threshold` dtype `<f8`) compare in float64 natively, so none of this applies to sklearn-to-SAS - no quantization, no verification gate, it just works.
+
+### XGBoost -> SAS: the quantizer
+
+If you specifically want XGBoost's own regularization/behavior rather than switching to `HistGradientBoosting`, there is a real, narrow path: quantize every feature to a small number of integer levels with `xgb2sql.IntegerBinner` *before* training, then call `xgb2sql.xgboost_to_sas(model, bins_per_feature=binner.levels())`. This only emits SAS if `check_xgb_sas_safety` confirms every threshold in the resulting model is actually safe against the declared achievable integer values - it raises `ValueError` with specifics otherwise.
+
+This checker went through one real revision worth knowing about: an early version used a "distance from threshold to nearest achievable integer" heuristic, which sounds right but is backwards - a threshold that happens to sit exactly ON an achievable value is the *safe* case (an exact value compares identically in any precision), not the risky one. That heuristic produced false-positive refusals on a model with 1000 bins and `max_depth=8` that turned out, once checked by directly simulating the float64-vs-float32-truncated comparison for every achievable value near each threshold (the correct check, now what's implemented), to be perfectly safe. Bottom line: trust `check_xgb_sas_safety`'s verdict, not an intuition about what "should" be safe - see `quantize.py` and `TESTING_PLAN.md` for the actual numbers from both the broken and fixed versions.
 
 ## Not yet verified
 
-- **MySQL and PostgreSQL as SQL targets.** Only DuckDB has been checked against a real instance. SQLite is confirmed *broken* as a target (`CAST(x AS FLOAT)` is a no-op there - no true 4-byte float type - ~7% of rows misrouted, up to 0.43 absolute error in testing). No Docker daemon has been available in any sandbox this package has been built in, so Postgres/MySQL verification needs to happen elsewhere (e.g. a GitHub Actions workflow with service containers). See `TESTING_PLAN.md`.
-- **SAS**, as above.
+- **MySQL and PostgreSQL as SQL targets.** Only DuckDB has been checked against a real instance. SQLite is confirmed *broken* as a target (`CAST(x AS FLOAT)` is a no-op there - no true 4-byte float type - ~7% of rows misrouted, up to 0.43 absolute error in testing). No Docker daemon has been available in any sandbox this package has been built in.
+- **SAS**, as above (both the sklearn path and the quantized-XGBoost path).
 
 ## Missing values
 
 - XGBoost: native three-way split (yes/no/missing) - always verified since it's part of every tree the converter walks.
-- sklearn (>=1.3): trees natively route NaN via a per-node `missing_go_to_left` flag, verified empirically against the model's own `.predict()` with NaN inputs (see `TESTING_PLAN.md`) - this is real support, not a fallback default.
+- sklearn (>=1.3, including `HistGradientBoosting`): trees natively route NaN via a per-node `missing_go_to_left` flag, verified empirically against the model's own `.predict()` with NaN inputs - this is real support, not a fallback default.
 
 ## Roadmap
 
-LightGBM and CatBoost as additional source models; verified MySQL/PostgreSQL and (pending real SAS access) verified SAS output; multiclass `GradientBoostingClassifier`.
+LightGBM and CatBoost as additional source models; verified MySQL/PostgreSQL and (pending real SAS access) verified SAS output; multiclass `GradientBoostingClassifier`/`HistGradientBoostingClassifier`; `HistGradientBoosting` categorical splits.

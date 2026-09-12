@@ -23,9 +23,16 @@ Was a single xgboost-specific `converter.py`. Now split so a new source model or
 - `converter.py` — thin backward-compatible wrapper exposing the original `xgboost_to_sql`/`xgboost_to_sql_multiclass` API.
 - `sklearn_api.py` — public `sklearn_to_sql`/`sklearn_to_sql_multiclass`/`sklearn_to_sas`/`sklearn_to_sas_multiclass`.
 
-## Status: 42 tests passing (`pytest tests/ -v`, ~150s, mostly XGBoost training time)
+## Status: 55 tests passing (`pytest tests/ -v`, ~190s, mostly XGBoost training time)
 
-20 xgboost tests (unchanged from before), 22 new scikit-learn tests (`tests/test_sklearn.py`) covering every supported estimator via real DuckDB execution for SQL, and via `tests/sas_interp.py` (a hand-written interpreter of the narrow SAS subset this package emits) for SAS.
+20 xgboost tests, 31 scikit-learn tests (`tests/test_sklearn.py` - now includes `HistGradientBoosting*`) via real DuckDB execution for SQL and `tests/sas_interp.py` for SAS, 6 quantizer tests (`tests/test_quantize.py`) covering the XGBoost-to-SAS quantization path (below).
+
+## This session's additions on top of the sklearn+SAS work above
+
+1. **`HistGradientBoostingRegressor`/`Classifier` (binary, non-categorical)** - turns out these need NONE of XGBoost's float32 caution. Confirmed by inspecting the fitted model's raw node arrays directly: `num_threshold` is genuine float64, not truncated. Verified exactly (0.0 diff) against `.predict()`/`.predict_proba()`, missing values included. Categorical HGB splits raise (bitset-based routing not implemented). Multiclass HGB raises (same reason as multiclass GBM).
+2. **A real, verified path from plain XGBoost to SAS**: `xgb2sql.IntegerBinner` (quantize features to a small number of ordinal integer levels before training) + `xgb2sql.xgboost_to_sas(model, bins_per_feature=...)`, which only emits SAS after `check_xgb_sas_safety` confirms every threshold is actually safe - raises otherwise. This came out of investigating "is there a training-time trick to make XGBoost safe for SAS" (the user's question): decimal-grid rounding was tried and empirically REJECTED (thresholds can land arbitrarily close to grid points regardless of grid spacing - see TESTING_PLAN.md for the numbers); integer/ordinal binning works, but only when actually verified per-model, not assumed - the first version of the safety checker had a real bug (a distance heuristic that got the exact-coincidence case backwards), caught by testing it against a real model before shipping. Fixed version directly simulates the comparison instead of using a proxy.
+
+Net effect: if XGBoost specifically isn't a hard requirement, `HistGradientBoosting` is the simpler way to get a SAS-safe gradient-boosted-tree model - no quantization gymnastics needed.
 
 ## The one thing to understand before touching SAS output
 
@@ -40,12 +47,13 @@ If you get access to real SAS: top priority is running the emitted expressions t
 
 ## Other open items, roughly in priority order
 
-1. **MySQL/PostgreSQL, still never verified** against a real instance (only DuckDB) — this was already open before this session, still is. No Docker daemon has been available in any sandbox used so far.
-2. **Verify SAS against real SAS** (above).
-3. **LightGBM** as a source model — architecturally closest to XGBoost (gradient-boosted trees, similar split semantics), highest-value next addition.
-4. **CatBoost** — oblivious/symmetric trees (every node at a given depth shares the same split) plus its own categorical target-encoding; structurally different enough to need real research before any code.
-5. **Multiclass `GradientBoostingClassifier`** — needs a per-round softmax across `n_classes` trees, not yet built (binary GBC and multiclass DecisionTree/RandomForest are both done).
-6. Carried over from before, still low-priority: unseen-category handling at inference, property-based testing (`hypothesis`), SQL/SAS size limits at scale (500+ trees).
+1. **MySQL/PostgreSQL, still never verified** against a real instance (only DuckDB) — open since the start. No Docker daemon has been available in any sandbox used so far.
+2. **Verify SAS against real SAS** (both the sklearn path and the quantized-XGBoost path) — also worth checking `IFN`'s performance on a large ensemble; the Python test interpreter (which deliberately shares SAS's documented non-short-circuiting `IFN` behavior) got slow enough on a 500-tree/depth-8 model that its test had to be trimmed to 20 rows.
+3. **LightGBM** as a source model — architecturally closest to XGBoost (gradient-boosted trees, similar split semantics), highest-value next addition. User asked for this explicitly; not started yet this session (ran out of natural stopping point after the HistGradientBoosting/quantizer work — pick this up next).
+4. **CatBoost** — oblivious/symmetric trees (every node at a given depth shares the same split) plus its own categorical target-encoding; structurally different enough to need real research before any code, not a quick port. User asked for this too; flagged rather than started, given how differently wrong a rushed implementation could go without something to verify it against.
+5. **Multiclass `GradientBoostingClassifier`/`HistGradientBoostingClassifier`** — needs a per-round softmax across `n_classes` trees, not yet built (binary GBC/HGBC and multiclass DecisionTree/RandomForest are done).
+6. **HistGradientBoosting categorical splits** — bitset-based routing exists in the fitted model, not parsed yet.
+7. Carried over from before, still low-priority: unseen-category handling at inference, property-based testing (`hypothesis`), SQL/SAS size limits at scale (500+ trees).
 
 ## Running things
 

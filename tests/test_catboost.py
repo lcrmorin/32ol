@@ -20,7 +20,13 @@ import pytest
 from catboost import CatBoostClassifier, CatBoostRegressor
 
 from sas_interp import SAS_MISSING, eval_sas_row
-from xgb2sql import IntegerBinner, catboost_to_sas, catboost_to_sql
+from xgb2sql import (
+    IntegerBinner,
+    catboost_to_sas,
+    catboost_to_sas_multiclass,
+    catboost_to_sql,
+    catboost_to_sql_multiclass,
+)
 from xgb2sql.parse_catboost import catboost_to_ensemble
 
 FEATURES = ["a", "b", "c"]
@@ -170,15 +176,142 @@ def test_multiclass_raises():
         catboost_to_sql(m)
 
 
-def test_categorical_feature_raises():
+def test_multiclass_sql():
+    rng = np.random.default_rng(0)
+    X = pd.DataFrame(rng.uniform(0, 100, size=(400, 3)), columns=FEATURES)
+    y3 = pd.cut(X["a"], 3, labels=False)
+    m = CatBoostClassifier(iterations=10, depth=4, verbose=False, random_seed=0, loss_function="MultiClass")
+    m.fit(X, y3)
+    sqls = catboost_to_sql_multiclass(m)
+    proba = m.predict_proba(X)
+    con = duckdb.connect()
+    con.register("t", X)
+    for c, sql in sqls.items():
+        _check_sql(con, sql, proba[:, c])
+
+
+def test_multiclass_to_sas_via_quantizer():
+    """Same quantizer requirement as binary/regression catboost_to_sas -
+    CatBoost's float32 truncation doesn't go away for multiclass.
+    """
+    rng = np.random.default_rng(17)
+    n = 3000
+    Xc = pd.DataFrame(rng.uniform(0, 1000, size=(n, 3)), columns=FEATURES)
+    y3 = pd.cut(Xc["a"] + Xc["b"] - Xc["c"], 3, labels=False)
+    binner = IntegerBinner(n_bins=16).fit(Xc)
+    Xb = binner.transform(Xc)
+    m = CatBoostClassifier(iterations=15, depth=4, verbose=False, random_seed=0, loss_function="MultiClass")
+    m.fit(Xb, y3)
+
+    sass = catboost_to_sas_multiclass(m, bins_per_feature=binner.levels())
+    proba = m.predict_proba(Xb)
+    Xs = Xb.iloc[:40]
+    for c, expr in sass.items():
+        got = np.array([
+            eval_sas_row(expr, FEATURES, {k: float(v) for k, v in row.items()})
+            for _, row in Xs.iterrows()
+        ])
+        np.testing.assert_allclose(got, proba[:40, c], atol=1e-6)
+
+
+def test_categorical_feature_ctr_raises():
+    """Default one_hot_max_size (2) with a 4-category, target-dependent
+    feature makes CatBoost fall back to CTR ('OnlineCtr') splits - not yet
+    supported (see parse_catboost.py for exactly what's known and missing).
+    """
     rng = np.random.default_rng(0)
     X = pd.DataFrame(rng.uniform(0, 100, size=(300, 2)), columns=["a", "b"])
     X["cat"] = rng.integers(0, 4, size=300).astype(str)
     y = X["a"] + X["b"] + (X["cat"] == "2").astype(float) * 50
     m = CatBoostRegressor(iterations=5, depth=3, verbose=False, random_seed=0, cat_features=["cat"])
     m.fit(X, y)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(NotImplementedError, match="OnlineCtr"):
+        catboost_to_sql(m, cat_feature_values={"cat": ["0", "1", "2", "3"]})
+
+
+def test_categorical_feature_onehot_missing_cat_feature_values_raises():
+    rng = np.random.default_rng(0)
+    X = pd.DataFrame(rng.uniform(0, 100, size=(300, 2)), columns=["a", "b"])
+    X["cat"] = rng.integers(0, 4, size=300).astype(str)
+    y = X["a"] + X["b"] + (X["cat"] == "2").astype(float) * 50
+    m = CatBoostRegressor(iterations=8, depth=4, verbose=False, random_seed=0,
+                           cat_features=["cat"], one_hot_max_size=10)
+    m.fit(X, y)
+    with pytest.raises(NotImplementedError, match="cat_feature_values"):
         catboost_to_sql(m)
+
+
+def test_categorical_feature_onehot_sql(data, duck):
+    """A categorical feature that stays under one_hot_max_size uses plain
+    OneHotFeature splits - fully supported. cat_feature_values is resolved
+    via CatBoost's own hashing (see parse_catboost.py), never reimplemented.
+    """
+    rng = np.random.default_rng(0)
+    n = 500
+    X = pd.DataFrame(rng.uniform(0, 100, size=(n, 2)), columns=["a", "b"])
+    X["cat"] = rng.integers(0, 4, size=n).astype(str)
+    y = X["a"] + X["b"] + (X["cat"] == "2").astype(float) * 50
+    m = CatBoostRegressor(iterations=12, depth=4, verbose=False, random_seed=0,
+                           cat_features=["cat"], one_hot_max_size=10)
+    m.fit(X, y)
+    sql = catboost_to_sql(m, cat_feature_values={"cat": ["0", "1", "2", "3"]})
+    con = duckdb.connect()
+    con.register("t", X)
+    _check_sql(con, sql, m.predict(X))
+
+
+def test_categorical_feature_onehot_classifier_and_multiclass_sql():
+    rng = np.random.default_rng(1)
+    n = 400
+    X = pd.DataFrame(rng.uniform(0, 100, size=(n, 2)), columns=["a", "b"])
+    X["cat"] = rng.integers(0, 4, size=n).astype(str)
+    cat_vals = {"cat": ["0", "1", "2", "3"]}
+    con = duckdb.connect()
+    con.register("t", X)
+
+    yb = ((X["a"] + X["b"] > 100) | (X["cat"] == "2")).astype(int)
+    mb = CatBoostClassifier(iterations=10, depth=4, verbose=False, random_seed=0,
+                             cat_features=["cat"], one_hot_max_size=10)
+    mb.fit(X, yb)
+    _check_sql(con, catboost_to_sql(mb, cat_feature_values=cat_vals), mb.predict_proba(X)[:, 1])
+
+    y3 = pd.cut(X["a"] + (X["cat"] == "2").astype(float) * 30, 3, labels=False)
+    m3 = CatBoostClassifier(iterations=10, depth=4, verbose=False, random_seed=0,
+                             cat_features=["cat"], one_hot_max_size=10, loss_function="MultiClass")
+    m3.fit(X, y3)
+    sqls = catboost_to_sql_multiclass(m3, cat_feature_values=cat_vals)
+    proba = m3.predict_proba(X)
+    for c, sql in sqls.items():
+        _check_sql(con, sql, proba[:, c])
+
+
+def test_categorical_feature_declared_but_unused_needs_no_cat_feature_values():
+    """A feature declared cat_features=[...] that the fitted model never
+    actually split on (irrelevant to the target) needs no cat_feature_values
+    at all - the split-type gate looks at what's actually in the trees, not
+    at what was merely declared at train time.
+    """
+    import json
+    import tempfile
+
+    rng = np.random.default_rng(1)
+    n = 300
+    X = pd.DataFrame(rng.uniform(0, 100, size=(n, 2)), columns=["a", "b"])
+    X["cat"] = rng.integers(0, 4, size=n).astype(str)
+    y = X["a"] + X["b"]  # genuinely independent of "cat"
+    m = CatBoostRegressor(iterations=8, depth=3, verbose=False, random_seed=0, cat_features=["cat"])
+    m.fit(X, y)
+    with tempfile.NamedTemporaryFile(suffix=".json") as f:
+        m.save_model(f.name, format="json")
+        dump = json.load(open(f.name))
+    split_types = {s.get("split_type") for t in dump["oblivious_trees"] for s in t["splits"]}
+    assert split_types <= {"FloatFeature"}, (
+        f"fixture didn't stay cat-independent - model used {split_types}, "
+        "adjust the fixture so this test still exercises the no-cat_feature_values path"
+    )
+    con = duckdb.connect()
+    con.register("t", X)
+    _check_sql(con, catboost_to_sql(m), m.predict(X))
 
 
 def test_lossguide_grow_policy_raises():

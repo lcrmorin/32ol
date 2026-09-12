@@ -57,6 +57,22 @@ def _sas_to_python(expr: str, feature_names) -> str:
     # 4. Function/keyword casing
     out = out.replace("IFN(", "ifn(").replace("MISSING(", "missing_(")
     out = re.sub(r"\bIN\s*\(", " in (", out)
+    out = re.sub(r"\bOR\b", "or", out)
+    out = re.sub(r"\bAND\b", "and", out)
+    out = re.sub(r"\bNOT\b", "not", out)
+
+    # 5. A single-category IN (...) becomes a Python parenthesized
+    # expression, not a 1-tuple, without a trailing comma - "in ('blue')"
+    # is "in" on the plain string 'blue' (a substring check, needing a
+    # string on the left) rather than tuple membership, which crashes when
+    # the left side is a non-string missing sentinel even though IFN's
+    # non-short-circuit evaluation means that branch's value is discarded
+    # either way. Add the trailing comma SAS's own IN doesn't need but
+    # Python's tuple literal does.
+    def _singleton_tuple(m):
+        inner = m.group(1)
+        return f"in ({inner},)" if inner.strip() and "," not in inner else m.group(0)
+    out = re.sub(r"\bin\s*\(([^()]*)\)", _singleton_tuple, out)
 
     return out
 

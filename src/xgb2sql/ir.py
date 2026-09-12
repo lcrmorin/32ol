@@ -43,6 +43,16 @@ class Split:
     # None = source model has no concept of missing for this split; the
     # emitter decides the fallback behavior (documented per-emitter).
     missing: "Node" = None
+    # Categorical splits only. None (the default, xgboost's case): any value
+    # not in `categories` goes to the "no" branch - a plain two-way split.
+    # Set (HistGradientBoosting's case): the FULL set of category values the
+    # source model saw during training (a superset of `categories`) - a
+    # value that's neither in `categories` NOR in `known_categories` is an
+    # unseen/unknown category, and is treated as MISSING (routed to
+    # `missing`, not `no`) - this is real, source-model-verified behavior
+    # (HistGradientBoosting's own C-level predictor does exactly this: see
+    # parse_sklearn.py), not a fallback default invented here.
+    known_categories: Optional[tuple] = None
 
 
 Node = Union[Leaf, Split]

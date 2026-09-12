@@ -150,18 +150,59 @@ def test_hist_gradient_boosting_classifier_multiclass_raises():
         sklearn_to_sql(m, FEATURES)
 
 
-def test_hist_gradient_boosting_categorical_split_raises():
-    rng = np.random.default_rng(0)
-    X = pd.DataFrame(rng.random((300, 2)), columns=["a", "b"])
-    cat = rng.integers(0, 4, size=300).astype(float)
+def _hgb_categorical_fixture(rng, n=300):
+    X = pd.DataFrame(rng.random((n, 2)), columns=["a", "b"])
+    cat = rng.integers(0, 4, size=n).astype(float)
     X["c"] = cat
-    y = (cat >= 2).astype(int)  # purely category-driven, so a categorical split is used
-    m = HistGradientBoostingClassifier(max_iter=5, max_depth=3, categorical_features=[2]).fit(X, y)
+    y = (cat >= 2).astype(int) + X["a"]  # category-driven but not purely, mixes with a numeric split
+    m = HistGradientBoostingRegressor(max_iter=8, max_depth=3, categorical_features=[2], random_state=0).fit(X, y)
     assert any(
         pred.nodes["is_categorical"].any() for round_ in m._predictors for pred in round_
     ), "fixture didn't actually produce a categorical split"
-    with pytest.raises(NotImplementedError):
-        sklearn_to_sql(m, ["a", "b", "c"])
+    return X, m
+
+
+def test_hist_gradient_boosting_categorical_split_sql(duck):
+    X, m = _hgb_categorical_fixture(np.random.default_rng(0))
+    con = duckdb.connect()
+    con.register("t", X)
+    _check_sql(con, sklearn_to_sql(m, ["a", "b", "c"]), m.predict(X))
+
+
+def test_hist_gradient_boosting_categorical_split_sas():
+    X, m = _hgb_categorical_fixture(np.random.default_rng(0))
+    _check_sas(sklearn_to_sas(m, ["a", "b", "c"]), X, m.predict(X))
+
+
+def test_hist_gradient_boosting_categorical_classifier_sql(duck):
+    rng = np.random.default_rng(1)
+    n = 300
+    X = pd.DataFrame(rng.random((n, 2)), columns=["a", "b"])
+    cat = rng.integers(0, 4, size=n).astype(float)
+    X["c"] = cat
+    y = ((cat >= 2).astype(int) + (X["a"] > 0.5)).clip(0, 1)
+    m = HistGradientBoostingClassifier(max_iter=8, max_depth=3, categorical_features=[2], random_state=0).fit(X, y)
+    con = duckdb.connect()
+    con.register("t", X)
+    _check_sql(con, sklearn_to_sql(m, ["a", "b", "c"]), m.predict_proba(X)[:, 1])
+
+
+def test_hist_gradient_boosting_categorical_unseen_category_routes_to_missing(duck):
+    """A category value never seen at train time must route exactly the way
+    HistGradientBoosting's own predictor does (see parse_sklearn.py docstring:
+    verified in sklearn's _predictor.pyx source - unknown categories fall
+    through to missing_go_to_left, same as a NaN). Construct predict-time
+    values genuinely outside the train-time category set and check against
+    the model's own .predict(), not an assumption.
+    """
+    X, m = _hgb_categorical_fixture(np.random.default_rng(2))
+    Xu = X.copy()
+    Xu.loc[::3, "c"] = 99.0  # never appeared in training (train used 0..3)
+    Xu.loc[::7, "c"] = np.nan  # also exercise plain missing on the same feature
+    con = duckdb.connect()
+    con.register("t", Xu)
+    _check_sql(con, sklearn_to_sql(m, ["a", "b", "c"]), m.predict(Xu))
+    _check_sas(sklearn_to_sas(m, ["a", "b", "c"]), Xu, m.predict(Xu))
 
 
 def test_gradient_boosting_regressor_unsupported_loss_raises():
@@ -241,6 +282,45 @@ def test_decision_tree_classifier_multiclass_sas(data):
     proba = m.predict_proba(X)
     for c, expr in sass.items():
         _check_sas(expr, X, proba[:, c])
+
+
+# ---- multiclass GradientBoostingClassifier / HistGradientBoostingClassifier
+# (raw-margin ensembles + a real cross-class softmax, unlike DT/RF above) ----
+
+def test_gradient_boosting_classifier_multiclass_sql(data, duck):
+    X, _, _, y3 = data
+    m = GradientBoostingClassifier(n_estimators=10, max_depth=3, random_state=0).fit(X, y3)
+    sqls = sklearn_to_sql_multiclass(m, FEATURES)
+    proba = m.predict_proba(X)
+    for c, sql in sqls.items():
+        _check_sql(duck, sql, proba[:, c])
+
+
+def test_gradient_boosting_classifier_multiclass_sas(data):
+    X, _, _, y3 = data
+    m = GradientBoostingClassifier(n_estimators=10, max_depth=3, random_state=0).fit(X, y3)
+    sass = sklearn_to_sas_multiclass(m, FEATURES)
+    proba = m.predict_proba(X)
+    for c, expr in sass.items():
+        _check_sas(expr, X.iloc[:40], proba[:40, c])
+
+
+def test_hist_gradient_boosting_classifier_multiclass_sql(data, duck):
+    X, _, _, y3 = data
+    m = HistGradientBoostingClassifier(max_iter=10, max_depth=3, random_state=0).fit(X, y3)
+    sqls = sklearn_to_sql_multiclass(m, FEATURES)
+    proba = m.predict_proba(X)
+    for c, sql in sqls.items():
+        _check_sql(duck, sql, proba[:, c])
+
+
+def test_hist_gradient_boosting_classifier_multiclass_sas(data):
+    X, _, _, y3 = data
+    m = HistGradientBoostingClassifier(max_iter=10, max_depth=3, random_state=0).fit(X, y3)
+    sass = sklearn_to_sas_multiclass(m, FEATURES)
+    proba = m.predict_proba(X)
+    for c, expr in sass.items():
+        _check_sas(expr, X.iloc[:40], proba[:40, c])
 
 
 # ---- missing values (sklearn's own native NaN support, verified) ----

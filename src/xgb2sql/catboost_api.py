@@ -13,10 +13,10 @@ Split nodes - so it's reused here as-is rather than duplicated.)
 
 from typing import Optional
 
-from xgb2sql.emit_sas import ensemble_to_sas
-from xgb2sql.emit_sql import ensemble_to_sql
+from xgb2sql.emit_sas import ensemble_to_sas, multiclass_to_sas
+from xgb2sql.emit_sql import ensemble_to_sql, multiclass_to_sql
 from xgb2sql.ir import Ensemble
-from xgb2sql.parse_catboost import catboost_to_ensemble
+from xgb2sql.parse_catboost import catboost_to_ensemble, catboost_to_multiclass_ensembles
 from xgb2sql.quantize import check_xgb_sas_safety
 
 
@@ -25,6 +25,7 @@ def catboost_to_sql(
     float_type: str = "FLOAT",
     double_type: str = "DOUBLE",
     link: Optional[str] = None,
+    cat_feature_values: Optional[dict] = None,
 ) -> str:
     """Convert a fitted CatBoostRegressor or binary CatBoostClassifier to a
     single SQL expression (the regression value, or P(class=1) for a
@@ -32,23 +33,29 @@ def catboost_to_sql(
 
     Args:
         model: Fitted CatBoostRegressor or CatBoostClassifier. Only
-            grow_policy="SymmetricTree" (the default), numeric-only features,
-            and single-target regression/binary classification are
-            supported - see parse_catboost.py.
+            grow_policy="SymmetricTree" (the default) and single-target
+            regression/binary classification are supported - see
+            parse_catboost.py. Categorical features are supported only when
+            every categorical split is "OneHotFeature" (see below).
         float_type / double_type: SQL type names for the float32-cast trick
             (needed here, unlike LightGBM/sklearn - see parse_catboost.py)
             and the float64 cast respectively.
         link: Explicit link override ("identity"/"logistic"). Auto-detected
             from the model's loss_function if omitted.
+        cat_feature_values: Required if the model has categorical features:
+            {feature_name: [every distinct raw category value that column
+            had at training time]} - see parse_catboost.py for why.
 
     Returns:
         SQL expression string for SELECT {expr} AS prediction FROM table.
     """
-    ensemble = catboost_to_ensemble(model, link=link)
+    ensemble = catboost_to_ensemble(model, link=link, cat_feature_values=cat_feature_values)
     return ensemble_to_sql(ensemble, float_type=float_type, double_type=double_type)
 
 
-def catboost_to_sas(model, bins_per_feature: dict, link: Optional[str] = None) -> str:
+def catboost_to_sas(
+    model, bins_per_feature: dict, link: Optional[str] = None, cat_feature_values: Optional[dict] = None,
+) -> str:
     """Convert a CatBoost model to SAS - ONLY if every feature was quantized
     to a small number of integer levels via xgb2sql.quantize.IntegerBinner
     (or an equivalent scheme) AND the resulting model's thresholds are
@@ -72,7 +79,7 @@ def catboost_to_sas(model, bins_per_feature: dict, link: Optional[str] = None) -
         ValueError: if any threshold isn't safely separated from an
             achievable quantized value.
     """
-    ensemble = catboost_to_ensemble(model, link=link)
+    ensemble = catboost_to_ensemble(model, link=link, cat_feature_values=cat_feature_values)
     violations = check_xgb_sas_safety(ensemble, bins_per_feature)
     if violations:
         shown = violations[:5]
@@ -90,3 +97,51 @@ def catboost_to_sas(model, bins_per_feature: dict, link: Optional[str] = None) -
         link=ensemble.link, threshold_precision="float64",
     )
     return ensemble_to_sas(safe_ensemble)
+
+
+def catboost_to_sql_multiclass(
+    model, float_type: str = "FLOAT", double_type: str = "DOUBLE",
+    cat_feature_values: Optional[dict] = None,
+) -> dict:
+    """Convert a fitted multiclass CatBoostClassifier (loss_function=
+    "MultiClass") to {class_index: sql_expression}, with softmax applied
+    across classes - same convention as xgboost/LightGBM multiclass.
+
+    cat_feature_values: see catboost_to_sql - required if the model has
+    categorical features.
+    """
+    ensembles = catboost_to_multiclass_ensembles(model, cat_feature_values=cat_feature_values)
+    return multiclass_to_sql(ensembles, float_type=float_type, double_type=double_type)
+
+
+def catboost_to_sas_multiclass(
+    model, bins_per_feature: dict, cat_feature_values: Optional[dict] = None,
+) -> dict:
+    """Multiclass equivalent of catboost_to_sas - same quantizer requirement
+    (CatBoost is float32-truncated regardless of class count), checked
+    independently for EVERY class's thresholds since they can differ even
+    though the split structure is shared (different leaf values per class
+    don't change threshold safety, but this checks each ensemble rather
+    than assuming one class's safety implies another's - the splits/borders
+    are actually identical across classes within a tree, so in practice
+    checking class 0 would suffice, but checking all of them costs little
+    and doesn't rely on that being true forever).
+    """
+    ensembles = catboost_to_multiclass_ensembles(model, cat_feature_values=cat_feature_values)
+    all_violations = {}
+    for c, ensemble in enumerate(ensembles):
+        v = check_xgb_sas_safety(ensemble, bins_per_feature)
+        if v:
+            all_violations[c] = v
+    if all_violations:
+        parts = [f"class {c}: {'; '.join(v[:3])}" for c, v in all_violations.items()]
+        raise ValueError(
+            "catboost_to_sas_multiclass refused: thresholds are not safely separated "
+            "from the declared achievable quantized values. " + " | ".join(parts) +
+            ". Try fewer bins, a shallower model, or fewer iterations."
+        )
+    safe_ensembles = [
+        Ensemble(trees=e.trees, base_score=e.base_score, link=e.link, threshold_precision="float64")
+        for e in ensembles
+    ]
+    return multiclass_to_sas(safe_ensembles)

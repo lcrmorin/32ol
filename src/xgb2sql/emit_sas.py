@@ -71,6 +71,19 @@ def _emit_node(node: Node) -> str:
                 quote_str_literal(v) if isinstance(v, str) else str(v) for v in node.categories
             )
             cond = f"({feat} IN ({parts}))"
+        if node.known_categories is not None:
+            if node.known_categories:
+                known_parts = ", ".join(
+                    quote_str_literal(v) if isinstance(v, str) else str(v)
+                    for v in node.known_categories
+                )
+                unknown_cond = f"NOT ({feat} IN ({known_parts}))"
+            else:
+                unknown_cond = "1"
+            return (
+                f"IFN(MISSING({feat}) OR {unknown_cond}, {missing_sas}, "
+                f"IFN({cond}, {yes_sas}, {no_sas}))"
+            )
     else:
         op = "<=" if node.le else "<"
         cond = f"({feat} {op} {node.threshold!r})"
@@ -78,26 +91,50 @@ def _emit_node(node: Node) -> str:
     return f"IFN(MISSING({feat}), {missing_sas}, IFN({cond}, {yes_sas}, {no_sas}))"
 
 
-def ensemble_to_sas(ensemble: Ensemble) -> str:
-    """Render one Ensemble (one output/class) as a SAS scalar expression,
-    usable as `prediction = {expr};` in a DATA step.
-    """
+def _check_float64(ensemble: Ensemble) -> None:
     if ensemble.threshold_precision != "float64":
         raise NotImplementedError(
             "SAS emission is only implemented for threshold_precision='float64' "
-            "(sklearn-sourced ensembles). xgboost-sourced ('float32') ensembles "
-            "are not supported yet - see this module's docstring for why "
-            "(no verified float32-truncation equivalent in a SAS DATA step)."
+            "(sklearn/LightGBM-sourced ensembles, or a quantized xgboost/CatBoost "
+            "ensemble that's already been re-tagged float64 after passing the "
+            "safety check). Plain 'float32' ensembles are not supported here - "
+            "see this module's docstring for why (no verified float32-truncation "
+            "equivalent in a SAS DATA step)."
         )
+
+
+def _raw_sas(ensemble: Ensemble) -> str:
     tree_sass = []
     for t in ensemble.trees:
         expr = f"({_emit_node(t.root)})"
         if t.weight != 1.0:
             expr = f"({t.weight!r} * {expr})"
         tree_sass.append(expr)
-    raw = f"{ensemble.base_score!r} + {' + '.join(tree_sass)}" if tree_sass else f"{ensemble.base_score!r}"
+    return f"{ensemble.base_score!r} + {' + '.join(tree_sass)}" if tree_sass else f"{ensemble.base_score!r}"
+
+
+def ensemble_to_sas(ensemble: Ensemble) -> str:
+    """Render one Ensemble (one output/class) as a SAS scalar expression,
+    usable as `prediction = {expr};` in a DATA step.
+    """
+    _check_float64(ensemble)
+    raw = _raw_sas(ensemble)
     if ensemble.link == "logistic":
         return f"(1 / (1 + exp(-({raw}))))"
     if ensemble.link == "exp":
         return f"(exp({raw}))"
     return f"({raw})"
+
+
+def multiclass_to_sas(ensembles: list) -> dict:
+    """Render a list of per-class raw-margin Ensembles (link="identity" -
+    same convention as emit_sql.multiclass_to_sql) as {class_idx: sas_expr},
+    with softmax applied across all classes in each expression via SAS's
+    exp() function. Every ensemble must be threshold_precision='float64' -
+    same restriction as ensemble_to_sas, for the same reason.
+    """
+    for e in ensembles:
+        _check_float64(e)
+    raws = [f"({_raw_sas(e)})" for e in ensembles]
+    denom = f"({' + '.join(f'exp({r})' for r in raws)})"
+    return {c: f"(exp({raws[c]}) / {denom})" for c in range(len(ensembles))}

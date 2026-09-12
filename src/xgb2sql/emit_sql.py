@@ -57,13 +57,23 @@ def _node_to_sql(node: Node, float_type: str, double_type: str, precision: str) 
     )
 
     if node.categories is not None:
+        unknown_check = ""
+        if node.known_categories is not None:
+            if node.known_categories:
+                known_parts = ", ".join(
+                    quote_str_literal(v) if isinstance(v, str) else str(v)
+                    for v in node.known_categories
+                )
+                unknown_check = f"OR {feat} NOT IN ({known_parts}) "
+            else:
+                unknown_check = "OR TRUE "  # no known categories at all -> everything is unknown
         if not node.categories:
-            return f"CASE WHEN {feat} IS NULL THEN {missing_sql} ELSE {no_sql} END"
+            return f"CASE WHEN {feat} IS NULL {unknown_check}THEN {missing_sql} ELSE {no_sql} END"
         parts = ", ".join(
             quote_str_literal(v) if isinstance(v, str) else str(v) for v in node.categories
         )
         return (
-            f"CASE WHEN {feat} IS NULL THEN {missing_sql} "
+            f"CASE WHEN {feat} IS NULL {unknown_check}THEN {missing_sql} "
             f"WHEN {feat} IN ({parts}) THEN {yes_sql} ELSE {no_sql} END"
         )
 

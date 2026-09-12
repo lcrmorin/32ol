@@ -15,12 +15,14 @@ from sklearn.ensemble import (
 )
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 
-from xgb2sql.emit_sas import ensemble_to_sas
-from xgb2sql.emit_sql import ensemble_to_sql
+from xgb2sql.emit_sas import ensemble_to_sas, multiclass_to_sas
+from xgb2sql.emit_sql import ensemble_to_sql, multiclass_to_sql
 from xgb2sql.parse_sklearn import (
     decision_tree_to_ensemble,
+    gradient_boosting_classifier_multiclass_to_ensembles,
     gradient_boosting_classifier_to_ensemble,
     gradient_boosting_regressor_to_ensemble,
+    hist_gradient_boosting_classifier_multiclass_to_ensembles,
     hist_gradient_boosting_classifier_to_ensemble,
     hist_gradient_boosting_regressor_to_ensemble,
     random_forest_to_ensemble,
@@ -60,14 +62,28 @@ def _model_to_ensemble(model, feature_names: list):
 
 
 def _multiclass_ensemble_builder(model, feature_names: list):
+    """For model types whose per-class ensemble is ALREADY a valid
+    probability (DecisionTreeClassifier/RandomForestClassifier) - no
+    cross-class softmax needed.
+    """
     if isinstance(model, DecisionTreeClassifier):
         return lambda c: decision_tree_to_ensemble(model, feature_names, class_index=c)
     if isinstance(model, RandomForestClassifier):
         return lambda c: random_forest_to_ensemble(model, feature_names, class_index=c)
-    raise NotImplementedError(
-        f"{type(model).__name__} multiclass is not supported here. "
-        "DecisionTreeClassifier and RandomForestClassifier are."
-    )
+    raise NotImplementedError(f"{type(model).__name__} does not use the direct-probability path here.")
+
+
+def _needs_softmax_ensembles(model, feature_names: list):
+    """For model types whose per-class ensembles are RAW MARGINS that need a
+    softmax combined across all classes at emit time (GradientBoostingClassifier,
+    HistGradientBoostingClassifier - same shape as xgboost multiclass), or None
+    if this model type isn't one of those.
+    """
+    if isinstance(model, GradientBoostingClassifier):
+        return gradient_boosting_classifier_multiclass_to_ensembles(model, feature_names)
+    if isinstance(model, HistGradientBoostingClassifier):
+        return hist_gradient_boosting_classifier_multiclass_to_ensembles(model, feature_names)
+    return None
 
 
 def sklearn_to_sql(model, feature_names: list, float_type: str = "FLOAT", double_type: str = "DOUBLE") -> str:
@@ -95,15 +111,20 @@ def sklearn_to_sql(model, feature_names: list, float_type: str = "FLOAT", double
 def sklearn_to_sql_multiclass(
     model, feature_names: list, float_type: str = "FLOAT", double_type: str = "DOUBLE"
 ) -> dict:
-    """Convert a fitted multiclass DecisionTreeClassifier or
-    RandomForestClassifier to {class_index: sql_expression_for_that_class_proba}.
+    """Convert a fitted multiclass classifier to {class_index: sql_expression}.
 
-    Each expression is already a valid probability on its own (they sum to 1
-    across classes by construction - both are averages of per-leaf class
-    proportions) - no softmax step needed, unlike xgboost/GBM multiclass.
-    GradientBoostingClassifier with >2 classes is NOT supported (see
-    parse_sklearn.py).
+    Two different shapes, handled transparently:
+    - DecisionTreeClassifier/RandomForestClassifier: each expression is
+      already a valid probability on its own (they sum to 1 across classes
+      by construction - both are averages of per-leaf class proportions) -
+      no softmax needed.
+    - GradientBoostingClassifier/HistGradientBoostingClassifier: each class's
+      raw margin needs a softmax combined across every class - handled by
+      emit_sql.multiclass_to_sql, same convention as xgboost multiclass.
     """
+    softmax_ensembles = _needs_softmax_ensembles(model, feature_names)
+    if softmax_ensembles is not None:
+        return multiclass_to_sql(softmax_ensembles, float_type=float_type, double_type=double_type)
     builder = _multiclass_ensemble_builder(model, feature_names)
     return {
         c: ensemble_to_sql(builder(c), float_type=float_type, double_type=double_type)
@@ -127,6 +148,9 @@ def sklearn_to_sas(model, feature_names: list) -> str:
 
 def sklearn_to_sas_multiclass(model, feature_names: list) -> dict:
     """SAS equivalent of sklearn_to_sql_multiclass - see its docstring."""
+    softmax_ensembles = _needs_softmax_ensembles(model, feature_names)
+    if softmax_ensembles is not None:
+        return multiclass_to_sas(softmax_ensembles)
     builder = _multiclass_ensemble_builder(model, feature_names)
     return {c: ensemble_to_sas(builder(c)) for c in range(len(model.classes_))}
 

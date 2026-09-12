@@ -4,31 +4,48 @@ Read this first if you're a fresh Claude session picking this up with no memory 
 
 ## What this is
 
-A dedicated package (not bundled with any other utilities) that converts a trained XGBoost `Booster` into a SQL `CASE WHEN` expression for in-database scoring, with float32-precision-correct thresholds and categorical-split support. See `README.md` for why this needed a dedicated package rather than an existing one — the short version: the closest prior art (`gbm2sql`, `sqlgbm`, R-only `xgb2sql`, `m2cgen`) is all small, stale, or not SQL-targeted.
+A package that converts a trained tree model into SQL or SAS for scoring outside Python. Two axes of coverage, both in progress:
 
-The user wants to maintain this for real production use. Longer-term direction (project-level, not started): extend to other tree libraries (scikit-learn, LightGBM, CatBoost) and other target languages beyond SQL — but current work is XGBoost → SQL only.
+- **Source models**: XGBoost (done, hardened), scikit-learn (`DecisionTree*`, `RandomForest*`, `GradientBoosting*` — done this session). Not yet: LightGBM, CatBoost, `HistGradientBoosting*`.
+- **Target languages**: SQL (done for both source models, verified against real DuckDB), SAS (done for scikit-learn only this session, NOT verified against real SAS — see below; blocked entirely for XGBoost, on purpose).
 
-## Layout
+See `README.md` for the full support matrix and usage, `TESTING_PLAN.md` for exactly what's been verified and how, `existing_package_mapping.md` for why this needed to be built rather than depending on something existing (checked again this session specifically for SAS — nothing real exists).
 
-- `src/xgb2sql/converter.py` — implementation.
-- `src/xgb2sql/__init__.py` — re-exports `xgboost_to_sql`, `xgboost_to_sql_multiclass`, `prepare_df_for_duckdb`.
-- `tests/test_xgb2sql.py` — 20 tests, all passing (`pytest tests/ -v`, ~145s — most of the time is XGBoost training, not SQL generation).
-- `TESTING_PLAN.md` — full status of what's verified and what's still open. **Read this before changing `converter.py`.**
-- `existing_package_mapping.md` — prior-art check.
+## Architecture (added this session)
 
-## Bugs fixed so far (see `TESTING_PLAN.md` for detail)
+Was a single xgboost-specific `converter.py`. Now split so a new source model or target language is one new file, not a rewrite of everything:
 
-Unescaped single quotes in categorical SQL literals; `dart` booster silently wrong (now raises); `gblinear` now rejected; unsafe objectives beyond binary:logistic/reg:squarederror (added a verified link-function table with auto-detection, real `exp`-link support); `base_score` edge cases now raise; `num_class` mismatch now raises; confirmed `num_parallel_tree > 1` needs no special handling.
+- `ir.py` — canonical tree representation (`Leaf`, `Split`, `Tree`, `Ensemble`) that every parser produces and every emitter consumes. Two fields exist specifically because sklearn and xgboost genuinely differ, not for generality's sake: `Split.le` (sklearn's yes-branch is `<=`, xgboost's is `<`) and `Ensemble.threshold_precision` (`"float32"` for xgboost — needs a truncation trick; `"float64"` for sklearn — must NOT be truncated).
+- `parse_xgb.py` — XGBoost `Booster` -> IR (moved out of the old `converter.py`, behavior-identical — all 20 original tests still pass unchanged after the move).
+- `parse_sklearn.py` — sklearn tree/ensemble -> IR (new).
+- `emit_sql.py` — IR -> SQL `CASE WHEN` (new; used by both source models).
+- `emit_sas.py` — IR -> SAS `IFN(...)` expression (new; sklearn only for now — raises for xgboost-sourced IR, see below).
+- `converter.py` — thin backward-compatible wrapper exposing the original `xgboost_to_sql`/`xgboost_to_sql_multiclass` API.
+- `sklearn_api.py` — public `sklearn_to_sql`/`sklearn_to_sql_multiclass`/`sklearn_to_sas`/`sklearn_to_sas_multiclass`.
 
-## Known, documented, unfixable-in-general limitation
+## Status: 42 tests passing (`pytest tests/ -v`, ~150s, mostly XGBoost training time)
 
-SQLite cannot be a target engine — `CAST(x AS FLOAT)` is a no-op there (no true 4-byte float type), breaking the float32-precision trick this tool depends on. Confirmed empirically (~7% rows misrouted, up to 0.43 absolute error). Tested explicitly rather than hidden.
+20 xgboost tests (unchanged from before), 22 new scikit-learn tests (`tests/test_sklearn.py`) covering every supported estimator via real DuckDB execution for SQL, and via `tests/sas_interp.py` (a hand-written interpreter of the narrow SAS subset this package emits) for SAS.
 
-## Top open item
+## The one thing to understand before touching SAS output
 
-The docstring/README claim "works on MySQL (FLOAT) and PostgreSQL (REAL)" has never been verified against either engine — only DuckDB (and SQLite, documented broken). No Docker daemon has been available in any sandbox used so far, so a real Postgres/MySQL container couldn't be spun up. If you have Docker (or can run a GitHub Actions workflow with `postgres:`/`mysql:` service containers), this is the top priority: train a model, generate SQL with `float_type="REAL"` (Postgres) or `float_type="FLOAT"` (MySQL), run it, compare to `Booster.predict()`. Given what SQLite revealed, don't assume the claim is true until checked.
+**No SAS installation has been available anywhere this package has been built.** `tests/sas_interp.py` checks the emitted SAS text is *internally consistent with itself* (does the logic it encodes match `model.predict()`?) — it does NOT confirm the code actually runs in real SAS. Two SAS-specific semantic quirks were designed around deliberately rather than assumed:
 
-Other open items, roughly in priority order after Postgres/MySQL: unseen-category handling at inference time (recommend NULL-mapping as documented safe practice); property-based testing with `hypothesis`; SQL length/nesting limits at scale (500+ trees, depth 10+); `reg:tweedie` and `multi:softmax` are in the allow-list/reasoning but not yet locked in with their own tests.
+1. SAS's `IFN`/`IFC` functions evaluate ALL arguments (not short-circuiting) — documented SAS behavior, handled correctly, but not benchmarked for performance on large ensembles.
+2. SAS treats numeric missing as smaller than any real number for ordinary comparisons (`. < 5` is TRUE) — NOT SQL's three-valued NULL logic. So every split explicitly checks `MISSING(col)` first rather than relying on comparison-propagation the way the SQL emitter safely can.
+
+**XGBoost -> SAS is deliberately blocked** (raises `NotImplementedError`, tested): the SQL emitter's float32-precision trick (`CAST(col AS FLOAT)`) has no verified SAS equivalent (SAS numerics are natively double precision; no confirmed bit-exact float32-truncation idiom), and the SQLite case already showed what skipping that trick costs (~7% of rows misrouted). Better to block than guess.
+
+If you get access to real SAS: top priority is running the emitted expressions there and comparing to `model.predict()`, the same way DuckDB already validates the SQL side. If sklearn-to-SAS checks out, the natural follow-up is finding a verified float32-truncation technique in SAS to unblock xgboost-to-SAS too.
+
+## Other open items, roughly in priority order
+
+1. **MySQL/PostgreSQL, still never verified** against a real instance (only DuckDB) — this was already open before this session, still is. No Docker daemon has been available in any sandbox used so far.
+2. **Verify SAS against real SAS** (above).
+3. **LightGBM** as a source model — architecturally closest to XGBoost (gradient-boosted trees, similar split semantics), highest-value next addition.
+4. **CatBoost** — oblivious/symmetric trees (every node at a given depth shares the same split) plus its own categorical target-encoding; structurally different enough to need real research before any code.
+5. **Multiclass `GradientBoostingClassifier`** — needs a per-round softmax across `n_classes` trees, not yet built (binary GBC and multiclass DecisionTree/RandomForest are both done).
+6. Carried over from before, still low-priority: unseen-category handling at inference, property-based testing (`hypothesis`), SQL/SAS size limits at scale (500+ trees).
 
 ## Running things
 
@@ -37,14 +54,11 @@ pip install --break-system-packages -e ".[test]"   # or drop --break-system-pack
 pytest tests/ -v
 ```
 
-Deps: `xgboost`, `duckdb`, `pytest` (`sqlite3` is stdlib). Real Postgres/MySQL testing additionally needs `psycopg2`/`pymysql` + a running server — not set up anywhere yet.
+Deps: `xgboost`, `scikit-learn>=1.3` (the version floor matters — `missing_go_to_left` on fitted trees, which the missing-value support depends on, needs it), `duckdb`, `pytest`.
 
 ## Known environment constraints (verify per-session, don't assume)
 
-- No GitHub push access / no `gh` CLI auth has been available in any sandbox so far — the user pushes manually. They're creating the GitHub repo themselves.
+- No GitHub push access / no `gh` CLI auth has been available in any sandbox so far — the user pushes manually.
 - No Docker daemon has been available in any sandbox so far — blocks real Postgres/MySQL verification.
+- No SAS installation has been available anywhere — blocks real SAS verification.
 - `api.github.com` has been blocked by sandbox proxies for unauthenticated calls; some GitHub HTML pages blocked by robots.txt. PyPI's JSON API (`https://pypi.org/pypi/<name>/json`) has been reliable for release-freshness checks.
-
-## Scope note
-
-This used to live inside a broader personal-utilities package (`dsutils`) alongside unrelated scripts (pandas helpers, a histogram plot, etc.). Per the user's instruction, this is now split out as its own dedicated package, and all mention of the unrelated scripts has been removed from this repo's docs — that work is being handled separately.

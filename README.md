@@ -10,14 +10,20 @@ Convert a trained tree model into SQL or SAS for scoring outside Python - no mod
 | `DecisionTreeRegressor` / `DecisionTreeClassifier` | Yes - verified against DuckDB | Yes - see "SAS caveat" below |
 | `RandomForestRegressor` / `RandomForestClassifier` | Yes - verified against DuckDB | Yes - see "SAS caveat" below |
 | `GradientBoostingRegressor` (`loss="squared_error"`) | Yes - verified against DuckDB | Yes - see "SAS caveat" below |
-| `GradientBoostingClassifier` (binary, `loss="log_loss"`) | Yes - verified against DuckDB | Yes - see "SAS caveat" below |
-| `HistGradientBoostingRegressor` / `Classifier` (binary, non-categorical) | Yes - verified against DuckDB | Yes - see "SAS caveat" below |
-| LightGBM (`Booster`/`LGBMRegressor`/`LGBMClassifier`, `boosting_type="gbdt"`, binary/regression) | Yes - verified against DuckDB | Yes, unconditionally - see "SAS caveat" below (no quantizer needed - see "Why LightGBM needs no quantizer" below) |
-| CatBoost (`CatBoostRegressor`/`CatBoostClassifier`, `grow_policy="SymmetricTree"`, numeric features only, binary/regression) | Yes - verified against DuckDB | Only if trained on quantized integer features - same quantizer as XGBoost, see below |
+| `GradientBoostingClassifier` (binary + multiclass, `loss="log_loss"`) | Yes - verified against DuckDB | Yes - see "SAS caveat" below |
+| `HistGradientBoostingRegressor` / `Classifier` (binary + multiclass; categorical features supported) | Yes - verified against DuckDB | Yes - see "SAS caveat" below |
+| LightGBM (`Booster`/`LGBMRegressor`/`LGBMClassifier`; `gbdt`/`dart`/`rf`/`goss`; binary + multiclass; categorical features supported) | Yes - verified against DuckDB | Yes, unconditionally - see "SAS caveat" below (no quantizer needed - see "Why LightGBM needs no quantizer" below) |
+| CatBoost (`CatBoostRegressor`/`CatBoostClassifier`, `grow_policy="SymmetricTree"`, binary + multiclass; categorical features supported for `OneHotFeature` splits - see below) | Yes - verified against DuckDB | Only if trained on quantized integer features - same quantizer as XGBoost, see below |
 
-Multiclass: supported for `DecisionTreeClassifier`/`RandomForestClassifier` (both languages) and XGBoost (SQL only). Multiclass `GradientBoostingClassifier`/`HistGradientBoostingClassifier`/LightGBM/CatBoost is not supported (raises `NotImplementedError`) - all need a per-round softmax across classes that hasn't been built yet.
+Multiclass: supported everywhere in the table above - `DecisionTreeClassifier`/`RandomForestClassifier` (already-normalized per-class probabilities, no softmax needed) and `GradientBoostingClassifier`/`HistGradientBoostingClassifier`/LightGBM/CatBoost (a real per-round softmax across classes, verified against each library's own `predict_proba`) - via each library's `*_to_sql_multiclass`/`*_to_sas_multiclass` entry point. XGBoost multiclass is SQL only (`xgboost_to_sql_multiclass`) - no SAS multiclass path has been built for XGBoost specifically.
 
-Not supported anywhere yet: `ExtraTrees*`, `HistGradientBoosting*` trained with `categorical_features` set, CatBoost trained with `cat_features` set, LightGBM `boosting_type` other than `"gbdt"` (`dart`/`rf`/`goss`) - all raise `NotImplementedError` rather than silently guessing.
+Categorical features:
+
+- **`HistGradientBoostingRegressor`/`Classifier`** (`categorical_features=[...]`): fully supported, decoded from the model's own bitset routing (`raw_left_cat_bitsets`) - no extra argument needed at call time.
+- **LightGBM** (`categorical_feature=[...]`): fully supported for both plain int/numeric-dtype categorical columns (no extra argument needed) and pandas `Categorical`-dtype columns (pass `categorical_feature_values={feature_name: [its raw category values]}` - see `lgbm_to_sql`'s docstring for why).
+- **CatBoost** (`cat_features=[...]`): supported **only** when CatBoost resolves the feature via a `OneHotFeature` split (i.e. it stays under `one_hot_max_size`) - pass `cat_feature_values={feature_name: [its raw category values]}`. High-cardinality categoricals that CatBoost routes through its CTR-based `OnlineCtr` splits are **not** supported and raise `NotImplementedError` naming `OnlineCtr` - see "Limitations" below.
+
+Not supported anywhere yet: `ExtraTrees*`, CatBoost's `OnlineCtr` categorical splits, CatBoost `grow_policy` other than `"SymmetricTree"` (`"Lossguide"`/`"Depthwise"`), `GradientBoostingRegressor` losses other than `"squared_error"` - all raise `NotImplementedError` rather than silently guessing. See "Limitations" below for the full list with why.
 
 **Deploying generated output in production?** See `DEPLOYMENT.md` - CI validation gates, versioning the generated expression against the model it came from, monitoring for drift, and the real accuracy tradeoff behind the XGBoost/CatBoost quantizer.
 
@@ -26,6 +32,18 @@ Not supported anywhere yet: `ExtraTrees*`, `HistGradientBoosting*` trained with 
 Closest prior art: `gbm2sql` (one-commit demo), `sqlgbm` (README says "not ready for production"), the R-only `xgb2sql` package of a similar name, and `m2cgen` (general model-export tool, 3,000 stars, but no release since April 2022, and SAS is not in its supported-language list - checked directly against its own README). The one SAS-adjacent tool found is a 7-star tutorial repo that hand-translates `m2cgen`'s Visual Basic output into SAS, not a real converter. See `existing_package_mapping.md`.
 
 ## Install
+
+Each source-model library is an **optional** dependency - install only the ones you use:
+
+```
+pip install xgb2sql[xgboost]              # just XGBoost
+pip install xgb2sql[lightgbm,catboost]    # just LightGBM + CatBoost
+pip install xgb2sql[all]                  # every source model
+```
+
+`import xgb2sql` always succeeds regardless of which of the four are installed. Calling a function whose library isn't installed (e.g. `lgbm_to_sql` without `lightgbm`) raises a plain `ImportError` naming the extra to install - `import xgb2sql` itself never fails because one library is missing.
+
+To develop/run the test suite (needs all four libraries plus `pytest`/`duckdb`):
 
 ```
 pip install -e ".[test]"
@@ -74,6 +92,68 @@ qmodel = CatBoostRegressor().fit(Xq, y)
 sas_expr = catboost_to_sas(qmodel, bins_per_feature=binner.levels())
 ```
 
+## Examples: multiclass and categorical features
+
+**Multiclass** - every `*_to_sql_multiclass`/`*_to_sas_multiclass` entry point returns `{class_index: expression}`, one expression per class, softmax-normalized so the values sum to 1 across classes:
+
+```python
+from sklearn.ensemble import HistGradientBoostingClassifier
+from xgb2sql import sklearn_to_sql_multiclass
+
+model = HistGradientBoostingClassifier().fit(X, y)  # y has 3+ classes
+sqls = sklearn_to_sql_multiclass(model, feature_names=list(X.columns))
+# sqls == {0: "...", 1: "...", 2: "..."} - one SELECT expression per class,
+# each equal to model.predict_proba(X)[:, class_index]
+```
+
+The same pattern works for `lgbm_to_sql_multiclass`/`lgbm_to_sas_multiclass` and `catboost_to_sql_multiclass`/`catboost_to_sas_multiclass`.
+
+**HistGradientBoosting categorical features** - no extra argument needed, the bitset routing is decoded automatically:
+
+```python
+from sklearn.ensemble import HistGradientBoostingRegressor
+from xgb2sql import sklearn_to_sql
+
+model = HistGradientBoostingRegressor(categorical_features=["region"]).fit(X, y)
+sql_expr = sklearn_to_sql(model, feature_names=list(X.columns))
+```
+
+**LightGBM categorical features** - a plain int/numeric-dtype categorical column needs nothing extra; a pandas `Categorical`-dtype column needs `categorical_feature_values` so the emitted SQL/SAS compares against the real category values rather than LightGBM's internal integer codes:
+
+```python
+import lightgbm as lgb
+from xgb2sql import lgbm_to_sql
+
+X["region"] = X["region"].astype("category")  # e.g. categories ["north", "south", "east"]
+model = lgb.train({"objective": "regression"}, lgb.Dataset(X, label=y, categorical_feature=["region"]))
+sql_expr = lgbm_to_sql(model, categorical_feature_values={"region": ["north", "south", "east"]})
+```
+
+**CatBoost categorical features** - only supported for low-cardinality features CatBoost resolves as `OneHotFeature` splits (i.e. under `one_hot_max_size`); `cat_feature_values` is required so xgb2sql can recover CatBoost's own category hash table (via CatBoost's own CPP exporter, not a reimplemented hash function):
+
+```python
+from catboost import CatBoostRegressor
+from xgb2sql import catboost_to_sql
+
+model = CatBoostRegressor(cat_features=["region"], one_hot_max_size=10).fit(X, y)
+sql_expr = catboost_to_sql(model, cat_feature_values={"region": ["north", "south", "east"]})
+# A high-cardinality categorical that CatBoost routes through OnlineCtr/CTR splits
+# instead raises NotImplementedError naming "OnlineCtr" - see Limitations below.
+```
+
+## Limitations
+
+Read this before picking xgb2sql for a model that might hit one of these - everything below raises `NotImplementedError`/`ValueError` rather than silently producing a wrong expression, so you'll find out at conversion time, not in production:
+
+- **CatBoost `OnlineCtr` categorical splits.** High-cardinality categorical features that CatBoost resolves via its target-statistic CTR counters (rather than a plain `OneHotFeature` split) are not supported - CatBoost's CTR hashing (`CalcHash`, a 64-bit multiplicative hash) is documented but not yet ported. Workaround: raise `one_hot_max_size` so CatBoost uses `OneHotFeature` splits instead, if the cardinality allows it.
+- **CatBoost `grow_policy` other than `"SymmetricTree"`** (`"Lossguide"`, `"Depthwise"`) - these produce a different, non-oblivious tree encoding this parser doesn't read.
+- **`GradientBoostingRegressor` losses other than `"squared_error"`** (`huber`, `quantile`, `absolute_error`) - their base-score/link formulas haven't been verified.
+- **sklearn `ExtraTreesRegressor`/`ExtraTreesClassifier`** - not implemented at all (only `DecisionTree*`/`RandomForest*`/`GradientBoosting*`/`HistGradientBoosting*`).
+- **MySQL and PostgreSQL as SQL targets are unverified** against a real instance (only DuckDB has been checked). SQLite is confirmed *broken* as a target - see "Not yet verified" below.
+- **SAS output is unverified against a real SAS instance** anywhere in this package - see "SAS caveat" below.
+- **Unseen-category handling at inference time** for categorical splits generally routes to a defined fallback (see each library's section in `TESTING_PLAN.md`), but hasn't been stress-tested across every combination of library/split-type.
+- **Ensemble size at scale** - very large ensembles (500+ trees, or CatBoost's `2**depth` nodes per tree at high depth) may produce SQL/SAS expressions that hit an engine's statement-size or nesting-depth limit; this hasn't been characterized.
+
 ## SAS caveat - read before using in production
 
 There is no SAS installation available anywhere this package has been built or tested. SAS output has been checked with a hand-written interpreter of the exact narrow SAS expression subset this package emits (`tests/sas_interp.py`) - it catches real logic bugs, but it is **not** the same as running the generated code in a real SAS session. Treat it with the same caution as the MySQL/PostgreSQL item below: logic checked as carefully as possible without the real target, but not yet confirmed against it.
@@ -107,4 +187,4 @@ See `DEPLOYMENT.md` for why this quantizer is a real accuracy tradeoff and when 
 
 ## Roadmap
 
-Verified MySQL/PostgreSQL and (pending real SAS access) verified SAS output; multiclass support for `GradientBoostingClassifier`/`HistGradientBoostingClassifier`/LightGBM/CatBoost; `HistGradientBoosting` categorical splits; CatBoost categorical features; LightGBM `dart`/`rf`/`goss` boosting modes.
+Verified MySQL/PostgreSQL and (pending real SAS access) verified SAS output; CatBoost `OnlineCtr` categorical splits (currently `OneHotFeature` only); XGBoost multiclass SAS output.

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xgb2sql"
+version = "0.1.0"
+description = "Convert a trained XGBoost model into a SQL expression for in-database scoring"
+readme = "README.md"
+authors = [{ name = "lcrmorin" }]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.23",
+    "pandas>=1.5",
+    "xgboost>=1.6",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "duckdb>=0.9"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,5 +1,7 @@
 # xgb2sql
 
+[![tests](https://github.com/lcrmorin/32ol/actions/workflows/tests.yml/badge.svg)](https://github.com/lcrmorin/32ol/actions/workflows/tests.yml)
+
 Convert a trained tree model into SQL or SAS for scoring outside Python - no model-serving runtime needed at inference time.
 
 ## Supported today

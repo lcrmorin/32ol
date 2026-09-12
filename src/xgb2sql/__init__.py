@@ -6,12 +6,14 @@ multiclass support. See README.md for usage and TESTING_PLAN.md for test
 coverage and open verification items.
 """
 
+from xgb2sql.catboost_api import catboost_to_sas, catboost_to_sql
 from xgb2sql.converter import (
     xgboost_to_sas,
     xgboost_to_sql,
     xgboost_to_sql_multiclass,
     prepare_df_for_duckdb,
 )
+from xgb2sql.lgbm_api import lgbm_to_sas, lgbm_to_sql
 from xgb2sql.quantize import IntegerBinner, check_xgb_sas_safety
 from xgb2sql.sklearn_api import (
     sklearn_to_sas,
@@ -30,6 +32,10 @@ __all__ = [
     "sklearn_to_sql_multiclass",
     "sklearn_to_sas",
     "sklearn_to_sas_multiclass",
+    "lgbm_to_sql",
+    "lgbm_to_sas",
+    "catboost_to_sql",
+    "catboost_to_sas",
     "IntegerBinner",
     "check_xgb_sas_safety",
 ]

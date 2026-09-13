@@ -84,8 +84,23 @@ def _node_to_sql(node: Node, float_type: str, double_type: str, precision: str) 
         thresh = f"{float(np.float32(node.threshold)):.20e}"
         cast_col = f"CAST({feat} AS {float_type})"
     else:
-        # Full float64 precision, no truncating cast.
-        thresh = repr(float(node.threshold))
+        # Full float64 precision, no truncating cast - but the literal still
+        # needs the same over-precise formatting as the float32 branch
+        # above, for a different reason: repr() gives the SHORTEST decimal
+        # string that round-trips back to the same double under PYTHON's
+        # own parser, but that is not a portable guarantee - DuckDB's
+        # decimal-literal parser was fuzz-tested against 20000 values from
+        # np.random.default_rng(0).random() and disagreed with Python's
+        # repr()-then-parse round-trip on ~10% of them (a real, latent bug:
+        # every float64-precision model type - sklearn, LightGBM, HGB - was
+        # exposed to this the whole time; it went undetected only because
+        # the fixed random seeds in this project's own test fixtures never
+        # happened to produce a threshold landing on one of the unlucky
+        # values, until a scikit-learn version bump changed which exact
+        # thresholds HistGradientBoosting picks - see TESTING_PLAN.md).
+        # %.20e - the same fix already used for the float32 branch - gave
+        # 0/20000 mismatches in the same fuzz test.
+        thresh = f"{float(node.threshold):.20e}"
         cast_col = f"CAST({feat} AS {double_type})"
     return (
         f"CASE WHEN {feat} IS NULL THEN {missing_sql} "

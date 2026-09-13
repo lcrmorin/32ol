@@ -55,7 +55,8 @@ _UNSUPPORTED_BOOSTERS = {
 
 
 def _check_booster_supported(cfg: dict) -> None:
-    name = cfg["learner"]["gradient_booster"]["name"]
+    gb = cfg["learner"]["gradient_booster"]
+    name = gb["name"]
     if name in _UNSUPPORTED_BOOSTERS:
         raise NotImplementedError(_UNSUPPORTED_BOOSTERS[name])
     if name != "gbtree":
@@ -63,6 +64,33 @@ def _check_booster_supported(cfg: dict) -> None:
             f"booster='{name}' has not been verified against a live prediction "
             "comparison and is not supported. Open an issue if you need it."
         )
+    # XGBoost (>=3.3-ish, exact version not pinned down) deprecated
+    # booster="dart" as a separate gradient_booster and folded it into
+    # "gbtree" instead - a dart-trained model now reports
+    # gradient_booster.name == "gbtree" too, with its dropout parameters
+    # under a dart_train_param block, rather than name == "dart" (verified
+    # empirically: a model trained with booster="dart" and rate_drop=0.3 on
+    # xgboost 3.4.1 reports name="gbtree", while the same call on xgboost
+    # 3.2.0 still reports name="dart" - see TESTING_PLAN.md). This means the
+    # `name in _UNSUPPORTED_BOOSTERS` check above silently stopped catching
+    # DART on newer xgboost - a real, caught-in-CI gap, not hypothetical:
+    # summing the dumped trees for such a model still disagreed with
+    # Booster.predict() by ~3x on a real example, exactly the failure this
+    # guard exists to prevent.
+    #
+    # A plain gbtree config ALSO carries a dart_train_param block (always
+    # present, verified on xgboost 3.4.1 for a model trained with
+    # booster="gbtree" and no dart parameters at all) - but with
+    # rate_drop=one_drop=skip_drop=0, which has no effect. So `name` alone no
+    # longer distinguishes dart from gbtree; check whether dropout is
+    # actually configured to do anything instead.
+    dart_cfg = gb.get("dart_train_param")
+    if dart_cfg is not None:
+        rate_drop = float(dart_cfg.get("rate_drop", 0))
+        one_drop = float(dart_cfg.get("one_drop", 0))
+        skip_drop = float(dart_cfg.get("skip_drop", 0))
+        if rate_drop > 0 or one_drop != 0 or skip_drop > 0:
+            raise NotImplementedError(_UNSUPPORTED_BOOSTERS["dart"])
 
 
 def _resolve_link(cfg: dict, sigmoid: bool, link: Optional[str]) -> str:

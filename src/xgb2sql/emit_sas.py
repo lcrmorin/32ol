@@ -86,7 +86,21 @@ def _emit_node(node: Node) -> str:
             )
     else:
         op = "<=" if node.le else "<"
-        cond = f"({feat} {op} {node.threshold!r})"
+        # Same fix as emit_sql.py's float64 branch, same reason: repr() is
+        # only guaranteed to round-trip through PYTHON's own float parser,
+        # not through some other language's. Confirmed as a real, not
+        # hypothetical, problem for DuckDB (fuzz-tested: ~10% of random
+        # floats round-trip to a DIFFERENT double via repr()-then-DuckDB-
+        # parse than via Python alone - see TESTING_PLAN.md and
+        # emit_sql.py). tests/sas_interp.py can't catch the SAS-specific
+        # version of this (it's a Python interpreter, so it round-trips
+        # repr() perfectly against itself either way) - but there's no
+        # reason to assume SAS's own decimal-literal parser is exempt from
+        # the same class of issue, so the same over-precise %.20e-style
+        # formatting is used here defensively, formatted the way a SAS
+        # DATA step expects scientific notation (uppercase E).
+        thresh = f"{float(node.threshold):.20E}"
+        cond = f"({feat} {op} {thresh})"
 
     return f"IFN(MISSING({feat}), {missing_sas}, IFN({cond}, {yes_sas}, {no_sas}))"
 
